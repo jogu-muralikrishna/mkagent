@@ -4711,9 +4711,12 @@ CREATE POLICY user_isolation_policy_keys ON api_keys
                         <Download className="w-4 h-4 text-emerald-400" />
                         <h3 className="text-xs font-bold text-white uppercase font-mono">Download Companion Client</h3>
                       </div>
-                      <p className="text-[11px] text-zinc-400 leading-relaxed">
-                        To pair your hardware, download and execute our lightweight Python client on your laptop.
-                      </p>
+                     <p className="text-[11px] text-zinc-400 leading-relaxed">
+                      To pair your hardware, download and execute our lightweight Python client on your laptop.
+                    </p>
+          <p className="text-[10px] text-amber-400/80 leading-relaxed">
+  ⚠️ If you already have a copy running and see "Connection error", your app's URL may have changed — re-download this file and restart the script.
+</p>
 
                       <div className="space-y-3">
                         <button
