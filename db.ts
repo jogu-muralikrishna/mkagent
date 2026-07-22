@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS document_knowledge (
   mime_type TEXT,
   extracted_text TEXT,
   file_data_base64 TEXT,
+  blob_url TEXT,
   created_at INTEGER NOT NULL
 );
 
@@ -548,4 +549,4 @@ export async function findUserByTelegramChatId(chatId: string): Promise<UserDoc 
   const pool = await getCorePool();
   const { rows } = await pool.query(`SELECT * FROM users WHERE telegram_chat_id = $1 LIMIT 1`, [chatId]);
   return rows[0] ? rowToUserDoc(rows[0]) : undefined;
-}s
+}
