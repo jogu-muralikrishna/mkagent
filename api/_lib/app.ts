@@ -30,9 +30,11 @@ import {
   setTelegramConfig,
   getTelegramConfig,
   findUserByTelegramChatId,
+  saveUploadChunk,
+  getUploadChunksOrdered,
+  deleteUploadChunks,
 } from "../../db.js";
 import multer from "multer";
-import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
 // pdf-parse (via pdfjs-dist) needs browser APIs (DOMMatrix) that don't
 // exist in Node's serverless runtime. Importing it at the top level was
 // crashing the ENTIRE server on every single request — including ones with
@@ -1351,91 +1353,64 @@ app.get("/api/documents/:userId", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// LARGE FILE UPLOADS (real fix for the 4MB/4.5MB wall above): the browser
-// uploads the file bytes DIRECTLY to Vercel Blob storage, never through this
-// serverless function — so Vercel's 4.5MB request-body cap never applies.
-// This function's only job is (1) hand out a short-lived upload token, and
-// (2) after the browser finishes, fetch the (now-hosted) file itself to run
-// text extraction and save the DB row. Both of those requests are tiny.
-//
-// REQUIRES: a Blob store connected to this Vercel project (Vercel dashboard
-// → Storage → create/connect a Blob store), which sets BLOB_READ_WRITE_TOKEN
-// automatically. Without that env var, uploads will fail with a clear error
-// telling you so, rather than the previous silent "Failed to upload file."
+// LARGE FILE UPLOADS (real fix, code-only — no external service or Vercel
+// dashboard step required): Vercel serverless functions hard-cap a single
+// incoming request at 4.5MB, a platform limit no app code can raise. So the
+// browser splits big files into small pieces (well under that cap) and
+// sends each as its own request; we stash the pieces temporarily in
+// Postgres (already required here for users/Telegram — no new dependency)
+// keyed by a session id, then reassemble + extract text + save once all
+// pieces have arrived, and clean up the temp pieces.
 // ---------------------------------------------------------------------------
-const ALLOWED_UPLOAD_MIME_TYPES = [
-  "application/pdf",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.ms-excel",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "text/plain",
-  "text/markdown",
-  "text/csv",
-  "application/json"
-];
-const MAX_BLOB_UPLOAD_BYTES = 50 * 1024 * 1024; // 50MB — matches what the UI has always claimed.
-
-app.post("/api/documents/blob-upload", async (req, res) => {
-  if (!process.env.BLOB_READ_WRITE_TOKEN) {
-    return res.status(503).json({ error: "File storage isn't configured on the server yet. In the Vercel dashboard, go to Storage → create/connect a Blob store to this project, then redeploy." });
-  }
-  const body = req.body as HandleUploadBody;
+app.post("/api/documents/upload-chunk", async (req, res) => {
   try {
-    const jsonResponse = await handleUpload({
-      body,
-      request: req as any,
-      onBeforeGenerateToken: async () => ({
-        allowedContentTypes: ALLOWED_UPLOAD_MIME_TYPES,
-        maximumSizeInBytes: MAX_BLOB_UPLOAD_BYTES,
-        addRandomSuffix: true
-      }),
-      onUploadCompleted: async ({ blob }) => {
-        // Vercel calls this via webhook once the blob is confirmed stored —
-        // only reachable when this deployment has a public URL (not local
-        // dev). The actual DB save doesn't depend on this: the client calls
-        // /api/documents/finalize explicitly right after upload() resolves,
-        // which works in every environment. This is just a log for visibility.
-        console.log("[blob-upload] Confirmed stored:", blob.url);
-      }
-    });
-    res.json(jsonResponse);
+    const { sessionId, chunkIndex, chunkBase64 } = req.body;
+    if (!sessionId || chunkIndex === undefined || !chunkBase64) {
+      return res.status(400).json({ error: "Missing required fields sessionId, chunkIndex, or chunkBase64" });
+    }
+    await saveUploadChunk(sessionId, Number(chunkIndex), chunkBase64);
+    res.json({ success: true });
   } catch (err: any) {
-    console.error("Blob upload token generation failed:", err);
-    res.status(400).json({ error: err.message || "Failed to authorize upload." });
+    console.error("Save upload chunk failed:", err);
+    res.status(500).json({ error: err.message || "Failed to save file chunk." });
   }
 });
 
-app.post("/api/documents/finalize", async (req, res) => {
+app.post("/api/documents/upload-finalize-chunked", async (req, res) => {
   try {
-    const { userId, category, blobUrl, filename, size, mimeType } = req.body;
-    if (!userId || !blobUrl || !filename) {
-      return res.status(400).json({ error: "Missing required fields userId, blobUrl, or filename" });
+    const { sessionId, userId, category, filename, size, mimeType } = req.body;
+    if (!sessionId || !userId || !filename) {
+      return res.status(400).json({ error: "Missing required fields sessionId, userId, or filename" });
     }
-    // Fetch the file back from Blob storage server-side (a tiny/no-op
-    // request from this function's perspective, unlike the original upload)
-    // so we can extract its text for Q&A, same as the small-file path does.
+    const chunks = await getUploadChunksOrdered(sessionId);
+    if (chunks.length === 0) {
+      return res.status(400).json({ error: "No chunks found for this upload session — it may have expired or failed partway through." });
+    }
+    // Chunks were each base64-encoded from a byte length that's a multiple
+    // of 3 (except possibly the very last one), so concatenating the base64
+    // STRINGS directly reconstructs the correct original bytes — no
+    // decode/re-encode round trip needed for each piece.
+    const fullBase64 = chunks.join("");
+    const buffer = Buffer.from(fullBase64, "base64");
     let text = "";
     try {
-      const blobRes = await fetch(blobUrl);
-      const arrayBuffer = await blobRes.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
       text = await extractTextFromFile({ buffer, originalname: filename, mimetype: mimeType, size: buffer.length } as any);
     } catch (extractErr) {
       console.warn("Text extraction failed for large upload (file is still saved, just not searchable via Q&A):", extractErr);
     }
     const id = "doc_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6);
     db.prepare(
-      "INSERT INTO document_knowledge (id, user_id, filename, category, size_bytes, mime_type, extracted_text, blob_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(id, userId, filename, category || "Other", size || 0, mimeType || "application/octet-stream", text, blobUrl, Date.now());
+      "INSERT INTO document_knowledge (id, user_id, filename, category, size_bytes, mime_type, extracted_text, file_data_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, userId, filename, category || "Other", size || buffer.length, mimeType || "application/octet-stream", text, fullBase64, Date.now());
+    await deleteUploadChunks(sessionId);
     res.json({
       success: true,
-      document: { id, filename, category: category || "Other", size_bytes: size || 0, mime_type: mimeType, created_at: Date.now() },
+      document: { id, filename, category: category || "Other", size_bytes: size || buffer.length, mime_type: mimeType, created_at: Date.now() },
       textExtracted: text.length > 0,
       documents: getDocuments(userId)
     });
   } catch (err: any) {
-    console.error("Finalize large upload failed:", err);
+    console.error("Finalize chunked upload failed:", err);
     res.status(500).json({ error: err.message || "Failed to save uploaded file." });
   }
 });
