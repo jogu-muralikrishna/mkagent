@@ -422,9 +422,37 @@ async function getCorePool(): Promise<Pool> {
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (session_id, chunk_index)
         );
+        CREATE TABLE IF NOT EXISTS laptop_status (
+          user_id TEXT PRIMARY KEY,
+          metrics_json TEXT NOT NULL,
+          online BOOLEAN NOT NULL DEFAULT TRUE,
+          last_sync TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS laptop_commands (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          command TEXT NOT NULL,
+          params_json TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          result TEXT,
+          file_ready BOOLEAN NOT NULL DEFAULT FALSE,
+          file_name TEXT,
+          file_size INTEGER,
+          delivered BOOLEAN NOT NULL DEFAULT FALSE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS laptop_files (
+          command_id TEXT PRIMARY KEY,
+          owner_id TEXT NOT NULL,
+          filename TEXT NOT NULL,
+          mime_type TEXT NOT NULL,
+          data_base64 TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
       `)
       .then(() => {
-        console.log("[db] Core Postgres tables ready (tasks/calendar/expenses/upload chunks).");
+        console.log("[db] Core Postgres tables ready (tasks/calendar/expenses/upload chunks/laptop).");
       })
       .catch((err) => {
         coreTablesReady = null;
@@ -588,4 +616,151 @@ export async function getUploadChunksOrdered(sessionId: string): Promise<string[
 export async function deleteUploadChunks(sessionId: string): Promise<void> {
   const pool = await getCorePool();
   await pool.query(`DELETE FROM document_upload_chunks WHERE session_id = $1`, [sessionId]);
+}
+
+// --- Laptop Agent (Postgres-backed — survives Vercel cold starts/instance
+// splitting; this replaces the old in-memory laptopStates/pendingCommands/
+// commandHistory/fetchedFiles objects in app.ts, which were the actual bug:
+// a serverless function can run on a different instance per request, so an
+// object in module scope is not shared state at all). ---
+
+export interface LaptopCommandDoc {
+  id: string;
+  command: string;
+  params: any;
+  status: "pending" | "success" | "failed";
+  result?: string;
+  timestamp: string;
+  fileReady?: boolean;
+  fileName?: string;
+  fileSize?: number;
+}
+
+export async function getLaptopStatus(userId: string): Promise<{ metrics: any; online: boolean; lastSync: string } | null> {
+  const pool = await getCorePool();
+  const { rows } = await pool.query(
+    `SELECT metrics_json, online, last_sync FROM laptop_status WHERE user_id = $1`,
+    [userId]
+  );
+  if (!rows[0]) return null;
+  return {
+    metrics: JSON.parse(rows[0].metrics_json),
+    online: !!rows[0].online,
+    lastSync: new Date(rows[0].last_sync).toLocaleTimeString()
+  };
+}
+
+export async function upsertLaptopStatus(userId: string, metrics: any): Promise<void> {
+  const pool = await getCorePool();
+  await pool.query(
+    `INSERT INTO laptop_status (user_id, metrics_json, online, last_sync) VALUES ($1, $2, TRUE, now())
+     ON CONFLICT (user_id) DO UPDATE SET metrics_json = EXCLUDED.metrics_json, online = TRUE, last_sync = now()`,
+    [userId, JSON.stringify(metrics)]
+  );
+}
+
+export async function enqueueLaptopCommand(userId: string, command: string, params: any): Promise<string> {
+  const pool = await getCorePool();
+  const id = newRandomId("cmd");
+  await pool.query(
+    `INSERT INTO laptop_commands (id, user_id, command, params_json, status) VALUES ($1, $2, $3, $4, 'pending')`,
+    [id, userId, command, params ? JSON.stringify(params) : null]
+  );
+  return id;
+}
+
+// Pulls pending commands for the companion agent's poll and marks them
+// delivered in the same round trip (no separate "clear queue" step, so
+// nothing is lost if two poll requests land on different instances).
+export async function pullPendingLaptopCommands(userId: string): Promise<Array<{ id: string; command: string; params: any }>> {
+  const pool = await getCorePool();
+  const { rows } = await pool.query(
+    `UPDATE laptop_commands SET delivered = TRUE
+     WHERE user_id = $1 AND delivered = FALSE
+     RETURNING id, command, params_json`,
+    [userId]
+  );
+  return rows.map((r) => ({ id: r.id, command: r.command, params: r.params_json ? JSON.parse(r.params_json) : undefined }));
+}
+
+export async function getLaptopCommandHistory(userId: string, limit = 50): Promise<LaptopCommandDoc[]> {
+  const pool = await getCorePool();
+  const { rows } = await pool.query(
+    `SELECT id, command, params_json, status, result, file_ready, file_name, file_size, created_at
+     FROM laptop_commands WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    [userId, limit]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    command: r.command,
+    params: r.params_json ? JSON.parse(r.params_json) : undefined,
+    status: r.status,
+    result: r.result ?? undefined,
+    timestamp: new Date(r.created_at).toLocaleTimeString(),
+    fileReady: !!r.file_ready,
+    fileName: r.file_name ?? undefined,
+    fileSize: r.file_size ?? undefined
+  }));
+}
+
+export async function recordLaptopCommandResult(
+  userId: string,
+  commandId: string,
+  success: boolean,
+  result: string | undefined
+): Promise<void> {
+  const pool = await getCorePool();
+  await pool.query(
+    `UPDATE laptop_commands SET status = $1, result = $2 WHERE id = $3 AND user_id = $4`,
+    [success ? "success" : "failed", result ?? null, commandId, userId]
+  );
+}
+
+export async function markLaptopCommandFileReady(
+  commandId: string,
+  fileName: string,
+  fileSize: number,
+  summary: string
+): Promise<void> {
+  const pool = await getCorePool();
+  await pool.query(
+    `UPDATE laptop_commands SET file_ready = TRUE, file_name = $1, file_size = $2, result = $3 WHERE id = $4`,
+    [fileName, fileSize, summary, commandId]
+  );
+}
+
+export async function saveLaptopFile(
+  commandId: string,
+  ownerId: string,
+  filename: string,
+  mimeType: string,
+  dataBase64: string,
+  sizeBytes: number
+): Promise<void> {
+  const pool = await getCorePool();
+  await pool.query(
+    `INSERT INTO laptop_files (command_id, owner_id, filename, mime_type, data_base64, size_bytes)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (command_id) DO UPDATE SET filename = EXCLUDED.filename, mime_type = EXCLUDED.mime_type,
+       data_base64 = EXCLUDED.data_base64, size_bytes = EXCLUDED.size_bytes`,
+    [commandId, ownerId, filename, mimeType, dataBase64, sizeBytes]
+  );
+}
+
+export async function getLaptopFile(
+  userId: string,
+  commandId: string
+): Promise<{ filename: string; mimeType: string; dataBase64: string; size: number } | null> {
+  const pool = await getCorePool();
+  const { rows } = await pool.query(
+    `SELECT filename, mime_type, data_base64, size_bytes FROM laptop_files WHERE command_id = $1 AND owner_id = $2`,
+    [commandId, userId]
+  );
+  if (!rows[0]) return null;
+  return {
+    filename: rows[0].filename,
+    mimeType: rows[0].mime_type,
+    dataBase64: rows[0].data_base64,
+    size: rows[0].size_bytes
+  };
 }
