@@ -33,6 +33,15 @@ import {
   saveUploadChunk,
   getUploadChunksOrdered,
   deleteUploadChunks,
+  getLaptopStatus,
+  upsertLaptopStatus,
+  enqueueLaptopCommand,
+  pullPendingLaptopCommands,
+  getLaptopCommandHistory,
+  recordLaptopCommandResult,
+  markLaptopCommandFileReady,
+  saveLaptopFile,
+  getLaptopFile,
 } from "../../db.js";
 import multer from "multer";
 // pdf-parse (via pdfjs-dist) needs browser APIs (DOMMatrix) that don't
@@ -910,6 +919,16 @@ ${contextData}
 });
 
 // --- LAPTOP AGENT STATE ENGINE (REAL-WORLD C2 POLLING SCHEME) ---
+// Postgres-backed (see db.ts: laptop_status / laptop_commands / laptop_files
+// tables via getCorePool()). This used to be plain module-level objects
+// (laptopStates/pendingCommands/commandHistory/fetchedFiles), which was the
+// actual bug: on Vercel, a serverless function can run on a different
+// instance per request (and cold starts wipe memory entirely), so an
+// in-memory object is not shared state between the request that dispatches
+// a command and the request that later polls for its result — a dashboard
+// could show "Success — Dispatched" while the instance that received the
+// file's data never serves the download request. Postgres is the one thing
+// every instance actually shares.
 interface LaptopState {
   cpu: number;
   ramTotal: string;
@@ -922,10 +941,7 @@ interface LaptopState {
   processes: Array<{ name: string; pid: number; cpu: number }>;
   // NOTE: these field names must match exactly what the frontend reads
   // (src/App.tsx laptopStatus?.<field>) and what the companion agent sends
-  // (src/code-templates.ts get_system_metrics()). Previously this interface
-  // used modelName/cpuModel/osName/gpuModel while the frontend read
-  // deviceName/processor/osModel/gpu — a real agent's data would never have
-  // displayed correctly even once connected.
+  // (src/code-templates.ts get_system_metrics()).
   deviceName?: string;
   osModel?: string;
   processor?: string;
@@ -937,145 +953,117 @@ interface LaptopState {
   publicIp?: string;
 }
 
-// No hardware is seeded here. Real values only ever arrive via a POST to
-// /api/laptop/sync from the actual companion agent running on the user's
-// machine (see src/code-templates.ts). Until that first sync happens, every
-// tenant is honestly "offline" with unknown specs — no placeholder hardware.
-let laptopStates: Record<string, LaptopState> = {};
-
-let pendingCommands: Record<string, Array<{ id: string; command: string; params: any }>> = {
-  murali: []
-};
-
-let commandHistory: Record<string, Array<{ id: string; command: string; params: any; status: "pending" | "success" | "failed"; result?: string; timestamp: string; fileReady?: boolean; fileName?: string; fileSize?: number }>> = {
-  murali: []
-};
-
-// Files fetched from the Laptop Companion, keyed by the commandId that
-// requested them. In-memory only, same as everything else here — cleared
-// on cold start. Kept separate from commandHistory so the (potentially
-// large) base64 payload doesn't bloat the history list the dashboard polls.
-const fetchedFiles: Record<string, { filename: string; mimeType: string; dataBase64: string; size: number; ownerId: string }> = {};
-
 // Get current Laptop Agent status
-app.get("/api/laptop/status/:userId", (req, res) => {
-  const { userId } = req.params;
-  const status = laptopStates[userId] || {
-    cpu: 0, ramTotal: "N/A", ramUsed: "N/A", diskTotal: "N/A", diskUsed: "N/A", volume: 0, online: false, lastSync: "N/A", processes: []
-  };
-  const history = commandHistory[userId] || [];
-  res.json({ status, history });
+app.get("/api/laptop/status/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const stored = await getLaptopStatus(userId);
+    const status: LaptopState = stored
+      ? { ...(stored.metrics as LaptopState), online: stored.online, lastSync: stored.lastSync }
+      : { cpu: 0, ramTotal: "N/A", ramUsed: "N/A", diskTotal: "N/A", diskUsed: "N/A", volume: 0, online: false, lastSync: "N/A", processes: [] };
+    const history = await getLaptopCommandHistory(userId);
+    res.json({ status, history });
+  } catch (err: any) {
+    console.error("[laptop/status] failed:", err);
+    res.status(500).json({ error: "Failed to load laptop status", details: err?.message });
+  }
 });
 
 // Enqueue system command from SaaS dashboard
-app.post("/api/laptop/command", (req, res) => {
-  const { userId, command, params } = req.body;
-  if (!userId || !command) {
-    return res.status(400).json({ error: "Missing required fields userId or command" });
+app.post("/api/laptop/command", async (req, res) => {
+  try {
+    const { userId, command, params } = req.body;
+    if (!userId || !command) {
+      return res.status(400).json({ error: "Missing required fields userId or command" });
+    }
+
+    const cmdId = await enqueueLaptopCommand(userId, command, params);
+    res.json({ success: true, message: "Command queued for Laptop Companion polling.", commandId: cmdId });
+  } catch (err: any) {
+    console.error("[laptop/command] failed:", err);
+    res.status(500).json({ error: "Failed to queue command", details: err?.message });
   }
-
-  const cmdId = "cmd_" + Math.random().toString(36).substring(2, 9);
-  const newCmd = { id: cmdId, command, params };
-  
-  if (!pendingCommands[userId]) pendingCommands[userId] = [];
-  pendingCommands[userId].push(newCmd);
-
-  if (!commandHistory[userId]) commandHistory[userId] = [];
-  commandHistory[userId].unshift({
-    id: cmdId,
-    command,
-    params,
-    status: "pending",
-    timestamp: new Date().toLocaleTimeString()
-  });
-
-  res.json({ success: true, message: "Command queued for Laptop Companion polling.", commandId: cmdId });
 });
 
 // Heartbeat sync invoked by the local Windows companion Python script
-app.post("/api/laptop/sync", (req, res) => {
-  const { userId, metrics } = req.body;
-  if (!userId) {
-    return res.status(400).json({ error: "Missing userId parameter" });
+app.post("/api/laptop/sync", async (req, res) => {
+  try {
+    const { userId, metrics } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: "Missing userId parameter" });
+    }
+
+    await upsertLaptopStatus(userId, metrics || {});
+    const cmds = await pullPendingLaptopCommands(userId);
+    res.json({ status: "success", pendingCommands: cmds });
+  } catch (err: any) {
+    console.error("[laptop/sync] failed:", err);
+    res.status(500).json({ error: "Failed to sync", details: err?.message });
   }
-
-  // Update online status and metrics
-  laptopStates[userId] = {
-    ...metrics,
-    online: true,
-    lastSync: new Date().toLocaleTimeString()
-  };
-
-  // Pull any pending commands
-  const cmds = pendingCommands[userId] || [];
-  pendingCommands[userId] = []; // Clear queue
-
-  res.json({ status: "success", pendingCommands: cmds });
 });
 
 // Windows client returns execution outcomes. For "get_file" commands the
 // companion packs the file as a JSON string into "result" (fileName,
 // mimeType, sizeBytes, data) rather than a separate field — we detect that
-// case, pull the base64 payload out into fetchedFiles (see below), and
-// replace the stored "result" text with a short human-readable summary so
-// the (potentially large) base64 blob never sits in the polled history list.
-app.post("/api/laptop/command-result", (req, res) => {
-  const { userId, commandId, success, result } = req.body;
-  if (!userId || !commandId) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
+// case, pull the base64 payload out into laptop_files, and replace the
+// stored "result" text with a short human-readable summary so the
+// (potentially large) base64 blob never sits in the polled history list.
+app.post("/api/laptop/command-result", async (req, res) => {
+  try {
+    const { userId, commandId, success, result } = req.body;
+    if (!userId || !commandId) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
 
-  if (commandHistory[userId]) {
-    const cmdIndex = commandHistory[userId].findIndex(c => c.id === commandId);
-    if (cmdIndex !== -1) {
-      const entry = commandHistory[userId][cmdIndex];
-      entry.status = success ? "success" : "failed";
-      entry.result = result;
-
-      if (success && entry.command === "get_file" && typeof result === "string") {
-        try {
-          const parsed = JSON.parse(result);
-          if (parsed && parsed.data && parsed.fileName) {
-            const sizeBytes = parsed.sizeBytes || Buffer.byteLength(parsed.data, "base64");
-            fetchedFiles[commandId] = {
-              filename: parsed.fileName,
-              mimeType: parsed.mimeType || "application/octet-stream",
-              dataBase64: parsed.data,
-              size: sizeBytes,
-              ownerId: userId
-            };
-            entry.fileReady = true;
-            entry.fileName = parsed.fileName;
-            entry.fileSize = sizeBytes;
-            entry.result = `File ready: ${parsed.fileName} (${(sizeBytes / 1024).toFixed(1)} KB)`;
-          }
-        } catch {
-          // Not a file payload (e.g. "file not found" message) — leave
-          // result as the plain text the companion sent.
+    let fileHandled = false;
+    if (success && typeof result === "string") {
+      try {
+        const parsed = JSON.parse(result);
+        if (parsed && parsed.data && parsed.fileName) {
+          const sizeBytes = parsed.sizeBytes || Buffer.byteLength(parsed.data, "base64");
+          await saveLaptopFile(commandId, userId, parsed.fileName, parsed.mimeType || "application/octet-stream", parsed.data, sizeBytes);
+          const summary = `File ready: ${parsed.fileName} (${(sizeBytes / 1024).toFixed(1)} KB)`;
+          await markLaptopCommandFileReady(commandId, parsed.fileName, sizeBytes, summary);
+          fileHandled = true;
         }
+      } catch {
+        // Not a file payload (e.g. "file not found" message) — fall through
+        // to storing result as plain text below.
       }
     }
-  }
 
-  res.json({ status: "ok" });
+    if (!fileHandled) {
+      await recordLaptopCommandResult(userId, commandId, success, result);
+    }
+
+    res.json({ status: "ok" });
+  } catch (err: any) {
+    console.error("[laptop/command-result] failed:", err);
+    res.status(500).json({ error: "Failed to record result", details: err?.message });
+  }
 });
 
 // Download a file that was fetched from the user's own laptop. Scoped to
 // the requesting user's own commands only — one visitor can't download
 // another visitor's fetched files, since these are keyed by commandId and
 // checked against the owner recorded when the file arrived.
-app.get("/api/laptop/file/:userId/:commandId", (req, res) => {
-  const { userId, commandId } = req.params;
-  const file = fetchedFiles[commandId];
-  if (!file || file.ownerId !== userId) {
-    return res.status(404).json({ success: false, error: "File not found or no longer available." });
-  }
+app.get("/api/laptop/file/:userId/:commandId", async (req, res) => {
+  try {
+    const { userId, commandId } = req.params;
+    const file = await getLaptopFile(userId, commandId);
+    if (!file) {
+      return res.status(404).json({ success: false, error: "File not found or no longer available." });
+    }
 
-  const buffer = Buffer.from(file.dataBase64, "base64");
-  res.setHeader("Content-Type", file.mimeType);
-  res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(file.filename)}"`);
-  res.setHeader("Content-Length", buffer.length.toString());
-  res.send(buffer);
+    const buffer = Buffer.from(file.dataBase64, "base64");
+    res.setHeader("Content-Type", file.mimeType);
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(file.filename)}"`);
+    res.setHeader("Content-Length", buffer.length.toString());
+    res.send(buffer);
+  } catch (err: any) {
+    console.error("[laptop/file] failed:", err);
+    res.status(500).json({ success: false, error: "Failed to fetch file", details: err?.message });
+  }
 });
 
 // --- REAL-TIME NEWS AGENT FEED API ---
