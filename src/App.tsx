@@ -346,7 +346,7 @@ export default function App() {
   };
 
   const [selectedAssistant, setSelectedAssistant] = useState<Assistant>(MOCK_USERS.murali.assistants[0]);
-  const [activeTab, setActiveTab] = useState<"dashboard" | "chat" | "wizard" | "vault" | "knowledge" | "automations" | "schema" | "laptop" | "mobile" | "telegram" | "scheduler">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "chat" | "wizard" | "vault" | "knowledge" | "schema" | "laptop" | "mobile" | "telegram" | "scheduler">("dashboard");
 
   // Gmail IMAP connection state (Admin Panel)
   const [gmailConfigured, setGmailConfigured] = useState(false);
@@ -660,6 +660,53 @@ export default function App() {
     }
   };
 
+  const [isSavingTelegramConfig, setIsSavingTelegramConfig] = useState(false);
+  const [telegramConfigSaved, setTelegramConfigSaved] = useState(false);
+
+  const handleSaveTelegramConfig = async () => {
+    if (!telegramToken || !telegramChatId) {
+      showNotification("Enter both Bot Token and Chat ID before saving.", "error");
+      return;
+    }
+    try {
+      setIsSavingTelegramConfig(true);
+      const res = await fetch(`/api/telegram/config/${activeUser.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: telegramToken, chatId: telegramChatId })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setTelegramConfigSaved(true);
+        showNotification("Telegram config saved — it'll persist across reloads and the bot can now reply to /briefing, /prep, etc.", "success");
+      } else {
+        showNotification(`Error: ${data.error || "Failed to save Telegram config."}`, "error");
+      }
+    } catch (err: any) {
+      console.error("Save telegram config error:", err);
+      showNotification(`Failed to save Telegram config: ${err.message}`, "error");
+    } finally {
+      setIsSavingTelegramConfig(false);
+    }
+  };
+
+  // Load any previously-saved config on startup so the fields aren't blank
+  // every time the page reloads — this is the actual bug that made the
+  // Telegram Hub look broken (nothing was ever persisted or reloaded).
+  useEffect(() => {
+    if (!activeUser?.id) return;
+    fetch(`/api/telegram/config/${activeUser.id}/status`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (data?.configured) {
+          if (data.token) setTelegramToken(data.token);
+          if (data.chatId) setTelegramChatId(data.chatId);
+          setTelegramConfigSaved(true);
+        }
+      })
+      .catch(err => console.warn("Failed to load telegram config:", err));
+  }, [activeUser?.id]);
+
   const handleSendTelegram = async () => {
     if (!telegramToken || !telegramChatId || !telegramMessage) {
       showNotification("Please provide your Bot Token, Chat ID, and message text.", "error");
@@ -680,6 +727,10 @@ export default function App() {
       if (res.ok && data.success) {
         showNotification("Alert broadcasted successfully to your Telegram chat!", "success");
         setTelegramMessage("");
+        // Auto-save on first successful send too, so a working token/chatId
+        // pair doesn't get lost on next reload even if they never clicked
+        // "Save".
+        if (!telegramConfigSaved) handleSaveTelegramConfig();
       } else {
         showNotification(`Error: ${data.error || "Failed to send message."}`, "error");
       }
@@ -1488,10 +1539,6 @@ export default function App() {
     showNotification(`Successfully seeded tenant row "${hydNames[randIdx]}" into PostgreSQL schema. Relational foreign key checks passed!`, "success");
   };
 
-  // --- AUTOMATIONS EXPANDED STATES & HANDLERS ---
-  const [newAutoTriggerType, setNewAutoTriggerType] = useState("Interval duration");
-  const [newAutoPayload, setNewAutoPayload] = useState("");
-
   const handleRunDbAudit = () => {
     setIsAuditingDb(true);
     setDbAuditLogs([
@@ -1531,124 +1578,6 @@ export default function App() {
     }, 2000);
   };
 
-  // --- AUTOMATIONS STATE ---
-  const [automations, setAutomations] = useState([
-    { id: "a1", name: "Daily Morning Briefing", trigger: "07:30 AM", triggerType: "Time-based Cron", type: "Telegram Bot", payload: "Daily Morning digest on AI advances & Telangana Tech ecosystem hubs", active: true },
-    { id: "a2", name: "Laptop RAM Overflow Safety Monitor", trigger: "Hardware Polling", triggerType: "Live Hardware Trigger", type: "In-App Push Alert", payload: "Notify murali if local Laptop RAM exceeds 90% threshold", active: true },
-    { id: "a3", name: "SaaS Tenant Integrity Guard", trigger: "Webhook API Call", triggerType: "Webhook API Call", type: "Log to PostgreSQL", payload: "Insert validation proof log to database on external ping", active: false }
-  ]);
-
-  const [newAutoName, setNewAutoName] = useState("");
-  const [newAutoTrigger, setNewAutoTrigger] = useState("08:00 AM");
-  const [newAutoType, setNewAutoType] = useState("Telegram Bot");
-
-  const handleAddAutomation = () => {
-    if (!newAutoName.trim()) return;
-    const newAuto = {
-      id: `auto-${Date.now()}`,
-      name: newAutoName,
-      trigger: newAutoTrigger,
-      triggerType: newAutoTriggerType,
-      type: newAutoType,
-      payload: newAutoPayload || "Default automation brief pipeline payload.",
-      active: true
-    };
-    setAutomations(prev => [...prev, newAuto]);
-    setNewAutoName("");
-    setNewAutoPayload("");
-    showNotification(`Successfully deployed background automation: "${newAuto.name}"!`);
-  };
-
-  const handleTriggerAutomationInstantly = (aut: any) => {
-    const actionDesc = aut.type;
-    const triggerDesc = aut.triggerType;
-    const payloadDesc = aut.payload;
-
-    if (actionDesc.includes("Telegram")) {
-      showNotification(
-        `⚡ BACKGROUND AUTOMATION TRIGGERED SUCCESSFULLY!\n\nAutomation: "${aut.name}"\nTrigger Source: ${triggerDesc}\nAction Executed: Sent Telegram Alert\nPayload Content: "${payloadDesc}"`,
-        "success"
-      );
-    } else if (actionDesc.includes("Shell Command") || actionDesc.includes("Daemon Script") || actionDesc === "Trigger Local Laptop Volume Adjustment" || actionDesc === "Launch Browser URL on Companion Client") {
-      showNotification(
-        <div className="space-y-1.5 text-left">
-          <p className="font-bold text-emerald-400">💻 NATIVE DAEMON SCRIPT EXECUTED ON LAPTOP COMPANION!</p>
-          <p className="text-[11px] text-zinc-300"><strong>Automation:</strong> {aut.name}</p>
-          <p className="text-[11px] text-zinc-300 font-mono bg-black/60 p-1.5 rounded border border-zinc-850">
-            $ {payloadDesc}
-          </p>
-          <div className="text-[10px] text-zinc-400 leading-normal border-t border-zinc-800 pt-1.5 font-mono">
-            <span className="text-emerald-400">stdout:</span> Process started successfully (PID: {Math.floor(Math.random() * 8000) + 1000}). Return code: 0 (OK)
-          </div>
-        </div>,
-        "success"
-      );
-    } else if (actionDesc.includes("Custom JS Script") || actionDesc.includes("Sandbox")) {
-      showNotification(
-        <div className="space-y-1.5 text-left">
-          <p className="font-bold text-indigo-400">🤖 EVALUATED CUSTOM JS SCRIPT IN SECURE SANDBOX!</p>
-          <p className="text-[11px] text-zinc-300"><strong>Engine:</strong> V8 Sandbox Sandbox Isolation</p>
-          <p className="text-[10px] text-zinc-400 font-mono bg-black/60 p-2 rounded border border-zinc-850 whitespace-pre-wrap">
-            {payloadDesc}
-          </p>
-          <div className="text-[10px] text-emerald-400 border-t border-zinc-800 pt-1.5 font-mono">
-            &gt; Execution completed in 1.4ms. Output: "Success"
-          </div>
-        </div>,
-        "success"
-      );
-    } else if (actionDesc.includes("Direct AI Agent") || actionDesc.includes("Jarvis Instruction")) {
-      showNotification(
-        <div className="space-y-1.5 text-left">
-          <p className="font-bold text-emerald-400">🧠 JARVIS DIRECT AGENT AUTOMATION TRIGGERED!</p>
-          <p className="text-[11px] text-zinc-300"><strong>Agent Task:</strong> Execute user instruction</p>
-          <p className="text-[10.5px] text-zinc-300 font-sans italic bg-zinc-950 p-2 rounded border border-zinc-850 leading-relaxed">
-            "Understood, Murali Krishna. I have processed the background instruction to '{payloadDesc}'. Relational schemas updated, assets verified, and notification pipelines have been dispatched accordingly."
-          </p>
-        </div>,
-        "success"
-      );
-    } else if (actionDesc.includes("Dynamic Webhook") || actionDesc.includes("HTTP Request")) {
-      showNotification(
-        <div className="space-y-1.5 text-left">
-          <p className="font-bold text-amber-400">🔌 DISPATCHED DYNAMIC HTTP WEBHOOK GATEWAY!</p>
-          <p className="text-[11px] text-zinc-300"><strong>Method:</strong> POST | Content-Type: application/json</p>
-          <div className="text-[10px] text-zinc-400 font-mono bg-black/60 p-2 rounded border border-zinc-850 whitespace-pre-wrap">
-            {payloadDesc}
-          </div>
-          <div className="text-[10px] text-emerald-400 border-t border-zinc-800 pt-1 font-mono">
-            &gt; Response status: 200 OK | Payload received.
-          </div>
-        </div>,
-        "success"
-      );
-    } else if (actionDesc === "In-App Push Alert") {
-      showNotification(
-        `🚨 CRITICAL AUTOMATION SYSTEM FIRE!\n\nAutomation: "${aut.name}"\nSensor Trigger: ${aut.trigger}\nTarget Action: Render Dynamic Modal Notification\nStatus: active\nPayload: "${payloadDesc}"`,
-        "info"
-      );
-    } else if (actionDesc === "Log to PostgreSQL" || actionDesc === "Log Custom to DB" || actionDesc.includes("Postgres")) {
-      // Actually add a row into DocKnowledge database dynamically!
-      const newDoc = {
-        id: "d_00" + (dbRowsDocKnowledge.length + 1),
-        user_id: activeUser.id,
-        filename: `auto_triggered_dump_${Date.now().toString().slice(-4)}.log`,
-        s3_storage_url: `s3://murali-vault/automation_logs/dump_${aut.id}.log`,
-        file_size_bytes: Math.floor(Math.random() * 20000) + 2000
-      };
-      setDbRowsDocKnowledge(prev => [...prev, newDoc]);
-      showNotification(
-        `🗄️ DATABASE ROW WRITTEN!\n\nAutomation: "${aut.name}"\nPostgres Table: "document_knowledge"\nSeeded Row Filename: "${newDoc.filename}"\nVerification: 100% compliant and isolated.`,
-        "success"
-      );
-    } else {
-      // Default / general communication gateways (Email, Slack, webhook)
-      showNotification(
-        `🔌 EXTERNAL WORKSPACE AUTOMATION BROADCAST!\n\nPipeline: "${aut.name}"\nAction Destination: ${actionDesc}\nPayload: "${payloadDesc}"`,
-        "success"
-      );
-    }
-  };
 
   // --- REAL TASK MANAGEMENT (backed by /api/tasks, not local-only state) ---
   const [newTaskText, setNewTaskText] = useState("");
@@ -1997,7 +1926,6 @@ export default function App() {
                 { id: "wizard", label: "Assistant Wizard", icon: Compass, badge: "New" },
                 { id: "vault", label: "API Key Vault", icon: LockKeyhole, badge: "Secure" },
                 { id: "knowledge", label: "Knowledge Base", icon: HardDrive, badge: "Files" },
-                { id: "automations", label: "Automations", icon: Zap, badge: "Cron" },
                 { id: "schema", label: "Database Relational", icon: Database, badge: "Postgres" },
                 { id: "laptop", label: "Laptop Companion", icon: Laptop, badge: "Sync" },
                 { id: "mobile", label: "Mobile App (PWA)", icon: Smartphone, badge: "PWA" },
@@ -3890,6 +3818,12 @@ export default function App() {
                             <div
                               key={f.id}
                               onClick={() => {
+                                // Actually opens the real uploaded file (not
+                                // just a Q&A panel) — the browser renders it
+                                // inline if it can (PDF/image/text) or
+                                // downloads it otherwise. Identical behavior
+                                // on mobile: it's just a normal link/tab.
+                                window.open(`/api/documents/${activeUser.id}/${f.id}/file`, "_blank");
                                 setSelectedFile(f);
                                 setDocQueryAnswer("");
                                 setDocQueryInput("");
@@ -4068,245 +4002,6 @@ export default function App() {
             )}
 
             {/* 6. AUTOMATIONS BUILDER TAB */}
-            {activeTab === "automations" && (
-              <motion.div
-                key="automations"
-                initial={{ opacity: 0, y: 5 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                className="max-w-4xl mx-auto space-y-6"
-              >
-                
-                <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                  <div>
-                    <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                      <Zap className="w-5 h-5 text-emerald-400" />
-                      CRON BACKGROUND SCHEDULER &amp; AUTOMATIONS
-                    </h2>
-                    <p className="text-xs text-zinc-400 mt-1">
-                      Set automated trigger conditions to execute briefs, compile code commits, or send Telegram alerts.
-                    </p>
-                  </div>
-                  <span className="text-[10px] font-mono text-zinc-500 bg-zinc-950 border border-zinc-800 px-3 py-1 rounded">
-                    Engine Status: ACTIVE
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-                  
-                  {/* Add automation schedule form */}
-                  <div className="md:col-span-5 bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-4">
-                    <span className="text-xs font-bold text-white font-mono uppercase border-b border-zinc-800 pb-2 block">
-                      Create Background Automation
-                    </span>
-
-                    <div className="space-y-3 text-xs">
-                      <div className="space-y-1">
-                        <label className="text-[11px] font-mono text-zinc-400">Automation Name</label>
-                        <input
-                          type="text"
-                          placeholder="e.g. Weekly LeetCode report"
-                          value={newAutoName}
-                          onChange={(e) => setNewAutoName(e.target.value)}
-                          className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-200"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="text-[11px] font-mono text-zinc-400">Trigger Type Category</label>
-                        <select
-                          value={newAutoTriggerType}
-                          onChange={(e) => {
-                            setNewAutoTriggerType(e.target.value);
-                            // Set suitable defaults for selected trigger type
-                            if (e.target.value === "Time-based Cron") {
-                              setNewAutoTrigger("07:30 AM");
-                            } else if (e.target.value === "Live Hardware Trigger") {
-                              setNewAutoTrigger("> 90% RAM Usage");
-                            } else if (e.target.value === "Tech/AI News Filter Alert") {
-                              setNewAutoTrigger("Topic: Telangana");
-                            } else if (e.target.value === "GitHub Event Hook") {
-                              setNewAutoTrigger("Streak Safe Sync");
-                            } else {
-                              setNewAutoTrigger("Webhook Ping Received");
-                            }
-                          }}
-                          className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-300"
-                        >
-                          <option value="Time-based Cron">Time-based Cron Schedule</option>
-                          <option value="Live Hardware Trigger">Live Hardware Metrics Sensor</option>
-                          <option value="Tech/AI News Filter Alert">Tech/AI News Monitor Sensor</option>
-                          <option value="GitHub Event Hook">GitHub Event Hook Connector</option>
-                          <option value="Custom Event Webhook">Custom Event Webhook Gate</option>
-                          <option value="Direct AI Brain Query Assertion">Continuous AI Brain Query Assertion</option>
-                        </select>
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="text-[11px] font-mono text-zinc-400">Trigger Sensor Value / Cadence</label>
-                        {newAutoTriggerType === "Time-based Cron" ? (
-                          <select
-                            value={newAutoTrigger}
-                            onChange={(e) => setNewAutoTrigger(e.target.value)}
-                            className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-300"
-                          >
-                            <option value="07:30 AM">07:30 AM (Daily Morning Briefing)</option>
-                            <option value="09:00 PM">09:00 PM (Daily Nightly Summary)</option>
-                            <option value="Every 1 Hour">Every 1 Hour (Intense Polling)</option>
-                            <option value="Every 12 Hours">Every 12 Hours (Twice Daily)</option>
-                            <option value="Monday 09:00 AM">Monday 09:00 AM (Weekly Checkup)</option>
-                          </select>
-                        ) : newAutoTriggerType === "Live Hardware Trigger" ? (
-                          <select
-                            value={newAutoTrigger}
-                            onChange={(e) => setNewAutoTrigger(e.target.value)}
-                            className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-300"
-                          >
-                            <option value="> 90% RAM Usage">Over 90% RAM Usage Alert</option>
-                            <option value="Low Disk Space < 10GB">Low Disk Space &lt; 10GB Safety Alarm</option>
-                            <option value="High CPU Load > 80%">High CPU Load &gt; 80% Performance Warning</option>
-                            <option value="Device Disconnected">Device Offline Polling Pulse</option>
-                          </select>
-                        ) : newAutoTriggerType === "Tech/AI News Filter Alert" ? (
-                          <select
-                            value={newAutoTrigger}
-                            onChange={(e) => setNewAutoTrigger(e.target.value)}
-                            className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-300"
-                          >
-                            <option value="Topic: Telangana">Telangana State Tech Ecosystem</option>
-                            <option value="Topic: AI India">India National AI Strategy</option>
-                            <option value="Topic: NVIDIA Blackwell">NVIDIA Blackwell Production</option>
-                            <option value="Topic: Google Gemini">Google Gemini Deepmind Announcements</option>
-                          </select>
-                        ) : (
-                          <input
-                            type="text"
-                            placeholder="e.g. Webhook API path match or custom code"
-                            value={newAutoTrigger}
-                            onChange={(e) => setNewAutoTrigger(e.target.value)}
-                            className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-200 font-mono"
-                          />
-                        )}
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="text-[11px] font-mono text-zinc-400">Action Execution Gateway</label>
-                        <select
-                          value={newAutoType}
-                          onChange={(e) => setNewAutoType(e.target.value)}
-                          className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-300"
-                        >
-                          <option value="Telegram Bot Notification">Send Telegram Bot Message</option>
-                          <option value="Direct Email Summary">Email Alert digest (SMTP Relay)</option>
-                          <option value="Slack webhook">Slack Webhook payload broadcast</option>
-                          <option value="Write to Postgres Relational Table">Write relational row to DB</option>
-                          <option value="Trigger Local Laptop Volume Adjustment">Laptop companion: adjust volume</option>
-                          <option value="Launch Browser URL on Companion Client">Laptop companion: launch URL</option>
-                          <option value="Log Event Pipeline to AWS S3 Storage">Dump log history to AWS S3</option>
-                          <option value="Execute Arbitrary Shell Command / Daemon Script">Execute Arbitrary Shell Command / Daemon Script</option>
-                          <option value="Custom JS Script Sandbox Runtime Engine">Custom JS Script Sandbox Runtime Engine</option>
-                          <option value="Direct AI Agent (Jarvis) Instruction Directive">Direct AI Agent (Jarvis) Instruction Directive</option>
-                          <option value="Dynamic Webhook HTTP Request (GET/POST with headers & JSON)">Dynamic Webhook HTTP Request (GET/POST with headers &amp; JSON)</option>
-                        </select>
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="text-[11px] font-mono text-zinc-400 flex justify-between">
-                          <span>Custom Action Payload</span>
-                          <span className="text-[9px] text-zinc-500 font-normal">What I give it can do those things</span>
-                        </label>
-                        <textarea
-                          placeholder={
-                            newAutoType === "Trigger Local Laptop Volume Adjustment" ? "e.g. 75" :
-                            newAutoType === "Launch Browser URL on Companion Client" ? "e.g. https://github.com" :
-                            "e.g. Enter custom alert message, json payload, or webhook body parameters"
-                          }
-                          rows={2}
-                          value={newAutoPayload}
-                          onChange={(e) => setNewAutoPayload(e.target.value)}
-                          className="w-full bg-zinc-950 border border-zinc-800 text-xs px-3 py-2 rounded-lg focus:outline-none text-zinc-200 font-mono resize-none"
-                        />
-                      </div>
-
-                      <button
-                        onClick={handleAddAutomation}
-                        className="w-full bg-emerald-500 hover:bg-emerald-400 text-black font-semibold p-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all mt-2 cursor-pointer font-mono font-bold"
-                      >
-                        <Zap className="w-4 h-4" />
-                        Deploy Automation
-                      </button>
-                    </div>
-
-                  </div>
-
-                  {/* Automations schedule list */}
-                  <div className="md:col-span-7 bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-4">
-                    <span className="text-xs font-bold text-white font-mono uppercase border-b border-zinc-800 pb-2 block">
-                      Active Scheduler Pipelines
-                    </span>
-
-                    <div className="space-y-3">
-                      {automations.map((aut) => (
-                        <div key={aut.id} className="bg-zinc-950 p-4 rounded-xl border border-zinc-850 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 text-xs">
-                          <div className="space-y-1.5 flex-1">
-                            <h4 className="font-bold text-zinc-200 flex items-center gap-2">
-                              <Zap className="w-3.5 h-3.5 text-amber-400" />
-                              {aut.name}
-                            </h4>
-                            <div className="grid grid-cols-2 gap-2 text-[10px] font-mono text-zinc-500">
-                              <div><span className="text-zinc-600">TRIGGER:</span> {aut.triggerType || "Sensor"} ({aut.trigger})</div>
-                              <div><span className="text-zinc-600">ACTION:</span> {aut.type}</div>
-                            </div>
-                            <p className="text-[10px] text-zinc-400 bg-zinc-900/60 p-2 rounded border border-zinc-850 font-mono break-all leading-normal">
-                              <span className="text-zinc-550 text-[9px] font-semibold block uppercase">Action Payload:</span>
-                              {aut.payload}
-                            </p>
-                          </div>
-
-                          <div className="flex sm:flex-col items-end gap-3 shrink-0 w-full sm:w-auto border-t sm:border-t-0 border-zinc-850/40 pt-2 sm:pt-0">
-                            <div className="flex items-center gap-2">
-                              <span className={`text-[10px] font-mono ${aut.active ? "text-emerald-400 font-bold" : "text-zinc-600"}`}>
-                                {aut.active ? "RUNNING" : "PAUSED"}
-                              </span>
-                              <button
-                                onClick={() => setAutomations(prev =>
-                                  prev.map(a => a.id === aut.id ? { ...a, active: !a.active } : a)
-                                )}
-                                className={`w-8 h-5 p-0.5 rounded-full transition-all cursor-pointer ${
-                                  aut.active ? "bg-emerald-500" : "bg-zinc-800"
-                                }`}
-                              >
-                                <div className={`w-4 h-4 bg-zinc-950 rounded-full transition-all ${
-                                  aut.active ? "translate-x-3" : "translate-x-0"
-                                }`} />
-                              </button>
-                            </div>
-
-                            <button
-                              onClick={() => handleTriggerAutomationInstantly(aut)}
-                              className="bg-indigo-950/40 hover:bg-indigo-900/50 text-indigo-400 hover:text-indigo-300 border border-indigo-900/50 hover:border-indigo-800 text-[10px] font-mono px-2.5 py-1 rounded transition-all cursor-pointer flex items-center gap-1 font-bold"
-                              title="Test trigger action right now"
-                            >
-                              Test Trigger ⚡
-                            </button>
-
-                            <button
-                              onClick={() => setAutomations(prev => prev.filter(a => a.id !== aut.id))}
-                              className="text-[10px] font-mono text-zinc-600 hover:text-red-400 transition-all cursor-pointer"
-                            >
-                              Remove ×
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                  </div>
-
-                </div>
-
-              </motion.div>
-            )}
 
             {/* 7. RELATIONAL DATABASE TAB */}
             {activeTab === "schema" && (
@@ -5427,6 +5122,21 @@ CREATE POLICY user_isolation_policy_keys ON api_keys
                       <p className="text-[10px] text-zinc-500 leading-normal">
                         Your bot token is securely encrypted. To discover your Chat ID, search for **"@userinfobot"** on Telegram, start a chat, and paste the ID here.
                       </p>
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={handleSaveTelegramConfig}
+                          disabled={isSavingTelegramConfig}
+                          className="bg-zinc-800 hover:bg-zinc-700 text-white px-3.5 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-2"
+                        >
+                          {isSavingTelegramConfig ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <HardDrive className="w-3.5 h-3.5" />}
+                          Save Config
+                        </button>
+                        {telegramConfigSaved && (
+                          <span className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" /> Saved — persists across reloads
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     {/* Broadcast Alerts Dispatcher */}
