@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { upload as blobUpload } from "@vercel/blob/client";
 import {
   RealEmail
 } from "./lib/firebase-types";
@@ -1347,11 +1348,26 @@ export default function App() {
     const f = e.target.files[0];
     setIsUploadingFile(true);
     try {
-      const formData = new FormData();
-      formData.append("file", f);
-      formData.append("userId", activeUser.id);
-      formData.append("category", newFileCategory);
-      const res = await fetch("/api/documents/upload", { method: "POST", body: formData });
+      // Uploads straight from the browser to Blob storage — the file bytes
+      // never pass through our serverless function, so Vercel's 4.5MB
+      // request-body cap (the actual cause of "Failed to upload file." on
+      // anything over ~4MB) never applies here.
+      const blob = await blobUpload(f.name, f, {
+        access: "public",
+        handleUploadUrl: "/api/documents/blob-upload"
+      });
+      const res = await fetch("/api/documents/finalize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: activeUser.id,
+          category: newFileCategory,
+          blobUrl: blob.url,
+          filename: f.name,
+          size: f.size,
+          mimeType: f.type
+        })
+      });
       if (res.ok) {
         const data = await res.json();
         setUploadedFiles(data.documents || []);
@@ -1364,11 +1380,11 @@ export default function App() {
         );
       } else {
         const err = await res.json().catch(() => ({}));
-        showNotification(err.error || "Failed to upload file.", "error");
+        showNotification(err.error || "File uploaded but failed to save its details.", "error");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.warn("Failed to upload file:", err);
-      showNotification("Failed to upload file.", "error");
+      showNotification(err?.message || "Failed to upload file.", "error");
     } finally {
       setIsUploadingFile(false);
       e.target.value = "";
