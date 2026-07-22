@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { put as blobPut } from "@vercel/blob/client";
 import {
   RealEmail
 } from "./lib/firebase-types";
@@ -1348,47 +1347,52 @@ export default function App() {
     const f = e.target.files[0];
     setIsUploadingFile(true);
     try {
-      // Manually request the client token instead of using @vercel/blob's
-      // upload() helper: that helper swallows our server's real error
-      // message and always throws the same generic "Failed to retrieve the
-      // client token" on any failure. Doing this step ourselves lets us
-      // show the actual reason (missing env var, wrong content type,
-      // whatever it really is) instead of guessing blind.
-      const callbackUrl = `${window.location.origin}/api/documents/blob-upload`;
-      const tokenRes = await fetch("/api/documents/blob-upload", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "blob.generate-client-token",
-          payload: {
-            pathname: f.name,
-            callbackUrl,
-            clientPayload: null,
-            multipart: false
-          }
-        })
-      });
-      const tokenData = await tokenRes.json().catch(() => ({}));
-      if (!tokenRes.ok || !tokenData.clientToken) {
-        // This is the REAL error from our server, not a generic SDK message.
-        throw new Error(tokenData.error || `Server rejected upload authorization (HTTP ${tokenRes.status}).`);
+      // Vercel serverless functions hard-cap a single request at 4.5MB — a
+      // platform limit, not something app code can raise. So instead of
+      // sending the whole file in one request (which silently failed
+      // before), we split it into small pieces client-side and upload each
+      // piece as its own tiny request, then ask the server to reassemble
+      // them. No external storage service or dashboard setup required —
+      // this only uses the Postgres connection this app already needs for
+      // logins/Telegram.
+      const CHUNK_BYTES = 2_359_296; // 2.25MB, divisible by 3 so each base64 chunk (except the last) has no padding and pieces can be joined as plain strings
+      const totalChunks = Math.ceil(f.size / CHUNK_BYTES) || 1;
+      const sessionId = `up_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+      const arrayBuffer = await f.arrayBuffer();
+      const fullBytes = new Uint8Array(arrayBuffer);
+
+      const bytesToBase64 = (bytes: Uint8Array): string => {
+        let binary = "";
+        const CHUNK = 8192; // avoid call-stack limits on String.fromCharCode with huge arrays
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+        }
+        return btoa(binary);
+      };
+
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_BYTES;
+        const end = Math.min(start + CHUNK_BYTES, fullBytes.length);
+        const chunkBase64 = bytesToBase64(fullBytes.subarray(start, end));
+        const chunkRes = await fetch("/api/documents/upload-chunk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId, chunkIndex: i, chunkBase64 })
+        });
+        if (!chunkRes.ok) {
+          const chunkErr = await chunkRes.json().catch(() => ({}));
+          throw new Error(chunkErr.error || `Failed uploading part ${i + 1} of ${totalChunks}.`);
+        }
       }
 
-      // Now actually upload the bytes straight to Blob storage using that
-      // token — this still never passes through our serverless function,
-      // so the 4.5MB body limit still doesn't apply.
-      const blob = await blobPut(f.name, f, {
-        access: "public",
-        token: tokenData.clientToken
-      });
-
-      const res = await fetch("/api/documents/finalize", {
+      const res = await fetch("/api/documents/upload-finalize-chunked", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          sessionId,
           userId: activeUser.id,
           category: newFileCategory,
-          blobUrl: blob.url,
           filename: f.name,
           size: f.size,
           mimeType: f.type
