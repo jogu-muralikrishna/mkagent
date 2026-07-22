@@ -30,12 +30,6 @@ import {
   setTelegramConfig,
   getTelegramConfig,
   findUserByTelegramChatId,
-  getAutomations,
-  getAllActiveAutomations,
-  createAutomation,
-  setAutomationActive,
-  deleteAutomation,
-  markAutomationRun
 } from "../../db.js";
 import multer from "multer";
 // pdf-parse (via pdfjs-dist) needs browser APIs (DOMMatrix) that don't
@@ -1376,9 +1370,14 @@ app.post("/api/documents/upload", (req, res, next) => {
     }
     const text = await extractTextFromFile(file);
     const id = "doc_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6);
+    // Store the actual file bytes too (not just extracted text) so the file
+    // can genuinely be opened/downloaded later — previously only the text
+    // was kept, so "opening" a file never showed the real file, only a Q&A
+    // panel over its text.
+    const fileDataBase64 = file.buffer ? file.buffer.toString("base64") : null;
     db.prepare(
-      "INSERT INTO document_knowledge (id, user_id, filename, category, size_bytes, mime_type, extracted_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(id, userId, file.originalname, category, file.size, file.mimetype, text, Date.now());
+      "INSERT INTO document_knowledge (id, user_id, filename, category, size_bytes, mime_type, extracted_text, file_data_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, userId, file.originalname, category, file.size, file.mimetype, text, fileDataBase64, Date.now());
     res.json({
       success: true,
       document: { id, filename: file.originalname, category, size_bytes: file.size, mime_type: file.mimetype, created_at: Date.now() },
@@ -1395,6 +1394,27 @@ app.delete("/api/documents/:userId/:docId", (req, res) => {
   const { userId, docId } = req.params;
   db.prepare("DELETE FROM document_knowledge WHERE id = ? AND user_id = ?").run(docId, userId);
   res.json({ success: true, documents: getDocuments(userId) });
+});
+
+// Serves the actual uploaded file back (real bytes, not just extracted
+// text) so a click on a file in the Knowledge Base genuinely opens/downloads
+// that file — in any browser, desktop or mobile, since this is just a
+// normal HTTP response with the right Content-Type. Browsers that can
+// render the type natively (PDF, images, text) show it inline; others
+// download it.
+app.get("/api/documents/:userId/:docId/file", (req, res) => {
+  const { userId, docId } = req.params;
+  const row = db.prepare(
+    "SELECT filename, mime_type, file_data_base64 FROM document_knowledge WHERE id = ? AND user_id = ?"
+  ).get(docId, userId) as { filename: string; mime_type: string | null; file_data_base64: string | null } | undefined;
+  if (!row) return res.status(404).json({ error: "Document not found" });
+  if (!row.file_data_base64) {
+    return res.status(404).json({ error: "Original file bytes weren't stored for this document (uploaded before this feature existed) — only its extracted text is available." });
+  }
+  const buffer = Buffer.from(row.file_data_base64, "base64");
+  res.setHeader("Content-Type", row.mime_type || "application/octet-stream");
+  res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(row.filename)}"`);
+  res.send(buffer);
 });
 
 // Returns the real extracted text for a document (used by chat RAG lookup).
@@ -1568,13 +1588,23 @@ app.post("/api/telegram/webhook", async (req, res) => {
   }
 });
 
-// Save the user's Telegram bot token + chat ID so automations can fire
-// without the browser being open (needed for real cron-based sends).
-app.post("/api/telegram/config", requireAuth, async (req: any, res) => {
+// Save the user's Telegram bot token + chat ID (used so the webhook can
+// match incoming messages to this user, and so the token/chatId persist
+// across page reloads instead of the fields going blank every time).
+//
+// NOTE: this previously required `requireAuth` (a Bearer-token session
+// check), but nothing in this frontend ever logs in or sends an
+// Authorization header anywhere in the app — every other endpoint here
+// (documents, laptop, tasks) takes userId directly in the URL instead.
+// requireAuth therefore always returned 401 for real browser use, which is
+// why saving/loading Telegram config silently never worked. Matching the
+// rest of the app's actual auth model fixes it.
+app.post("/api/telegram/config/:userId", async (req, res) => {
+  const { userId } = req.params;
   const { token, chatId } = req.body;
   if (!token || !chatId) return res.status(400).json({ error: "Missing required fields token or chatId" });
   try {
-    await setTelegramConfig(req.user.id, token, chatId);
+    await setTelegramConfig(userId, token, chatId);
     res.json({ success: true });
   } catch (err: any) {
     console.error("Save telegram config failed:", err);
@@ -1582,142 +1612,13 @@ app.post("/api/telegram/config", requireAuth, async (req: any, res) => {
   }
 });
 
-app.get("/api/telegram/config/status", requireAuth, async (req: any, res) => {
+app.get("/api/telegram/config/:userId/status", async (req, res) => {
   try {
-    const cfg = await getTelegramConfig(req.user.id);
-    res.json({ configured: !!(cfg.token && cfg.chatId), chatId: cfg.chatId || null });
+    const cfg = await getTelegramConfig(req.params.userId);
+    res.json({ configured: !!(cfg.token && cfg.chatId), token: cfg.token || null, chatId: cfg.chatId || null });
   } catch (err: any) {
     console.error("Get telegram config failed:", err);
     res.status(500).json({ error: err.message || "Failed to load Telegram config." });
-  }
-});
-
-// --- AUTOMATIONS (real, Postgres-backed. Fires for real via /api/cron/run,
-// see below and vercel.json's "crons" entry / the in-process scheduler in
-// server.ts for how that endpoint actually gets called on a timer.) ---
-app.get("/api/automations/:userId", async (req, res) => {
-  try {
-    res.json({ automations: await getAutomations(req.params.userId) });
-  } catch (err: any) {
-    console.error("Get automations failed:", err);
-    res.status(500).json({ error: err.message || "Failed to load automations." });
-  }
-});
-
-app.post("/api/automations", async (req, res) => {
-  const { userId, name, triggerTime, intervalHours, actionType, payload } = req.body;
-  if (!userId || !name || !payload) {
-    return res.status(400).json({ error: "Missing required fields userId, name, or payload" });
-  }
-  if (!triggerTime && !intervalHours) {
-    return res.status(400).json({ error: "Provide either triggerTime (daily 'HH:MM') or intervalHours (e.g. 6 for every 6 hours)" });
-  }
-  if (triggerTime && !/^\d{2}:\d{2}$/.test(triggerTime)) {
-    return res.status(400).json({ error: "triggerTime must be 24-hour HH:MM, e.g. '07:30'" });
-  }
-  const hours = intervalHours ? Number(intervalHours) : null;
-  if (hours !== null && (!Number.isInteger(hours) || hours < 1)) {
-    return res.status(400).json({ error: "intervalHours must be a whole number ≥ 1" });
-  }
-  try {
-    const automation = await createAutomation(userId, name, triggerTime || null, hours, actionType || "telegram", payload);
-    res.json({ success: true, automation, automations: await getAutomations(userId) });
-  } catch (err: any) {
-    console.error("Create automation failed:", err);
-    res.status(500).json({ error: err.message || "Failed to create automation." });
-  }
-});
-
-app.put("/api/automations/:userId/:id/toggle", async (req, res) => {
-  const { userId, id } = req.params;
-  const { active } = req.body;
-  try {
-    await setAutomationActive(userId, id, !!active);
-    res.json({ success: true, automations: await getAutomations(userId) });
-  } catch (err: any) {
-    console.error("Toggle automation failed:", err);
-    res.status(500).json({ error: err.message || "Failed to update automation." });
-  }
-});
-
-app.delete("/api/automations/:userId/:id", async (req, res) => {
-  const { userId, id } = req.params;
-  try {
-    await deleteAutomation(userId, id);
-    res.json({ success: true, automations: await getAutomations(userId) });
-  } catch (err: any) {
-    console.error("Delete automation failed:", err);
-    res.status(500).json({ error: err.message || "Failed to delete automation." });
-  }
-});
-
-// Real, timer-driven execution of due automations. Something has to call
-// this endpoint on a schedule for automations to actually fire — see
-// vercel.json ("crons") for Vercel deployments, or the in-process
-// node-cron scheduler added in server.ts for a persistent host (e.g.
-// Render/Railway). Neither existed before; this was the missing piece
-// that made the whole "Automations" tab fake (the frontend button only
-// simulated a toast, nothing ran on a schedule).
-//
-// Protected with CRON_SECRET (optional) so randoms can't hit this and spam
-// your Telegram chat — if you set CRON_SECRET, the caller must send it as
-// header "x-cron-secret".
-app.post("/api/cron/run", async (req, res) => {
-  const expected = process.env.CRON_SECRET;
-  if (expected && req.get("x-cron-secret") !== expected) {
-    return res.status(401).json({ error: "Invalid or missing cron secret." });
-  }
-  try {
-    const now = new Date();
-    const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-    const today = now.toISOString().slice(0, 10);
-    const all = await getAllActiveAutomations();
-
-    const due = all.filter((a) => {
-      if (a.triggerTime) {
-        // Daily mode: fires once, at that exact HH:MM, at most once per day.
-        return a.triggerTime === currentTime && a.lastRunDate !== today;
-      }
-      if (a.intervalHours) {
-        // Interval mode: fires if intervalHours have elapsed since it last
-        // ran (or it's never run yet). Precise to the minute, not the day —
-        // this is what makes "every 6 hours" actually work.
-        if (!a.lastRunAt) return true;
-        const elapsedMs = now.getTime() - new Date(a.lastRunAt).getTime();
-        return elapsedMs >= a.intervalHours * 60 * 60 * 1000;
-      }
-      return false;
-    });
-
-    const results: any[] = [];
-    for (const a of due) {
-      if (a.actionType === "telegram") {
-        const cfg = await getTelegramConfig(a.userId);
-        if (cfg.token && cfg.chatId) {
-          // Payload is treated as an AI PROMPT, not literal text, so e.g. a
-          // "every 6 hours" weather automation gets a fresh AI-generated
-          // weather update each time instead of repeating the same static
-          // string forever. Falls back to sending the payload literally if
-          // the AI call fails, so a broken Gemini call doesn't silently
-          // eat scheduled sends.
-          let messageBody = a.payload;
-          try {
-            messageBody = await askAssistant(a.payload, "MK", "Helpful Professional");
-          } catch (aiErr: any) {
-            console.error("[cron] AI generation failed for automation, sending raw payload:", a.id, aiErr);
-          }
-          const sent = await sendTelegramMessage(cfg.token, cfg.chatId, `⏰ *${a.name}*\n${messageBody}`);
-          results.push({ id: a.id, name: a.name, ...sent });
-        } else {
-          results.push({ id: a.id, name: a.name, ok: false, error: "Telegram not configured for this user." });
-        }
-      }
-      await markAutomationRun(a.id, today);
-    }
-    res.json({ success: true, checkedAt: currentTime, ran: results });
-  } catch (err: any) {
-    console.error("Cron run failed:", err);
-    res.status(500).json({ error: err.message || "Cron run failed." });
   }
 });
 
