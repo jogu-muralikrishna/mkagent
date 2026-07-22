@@ -32,6 +32,7 @@ import {
   findUserByTelegramChatId,
 } from "../../db.js";
 import multer from "multer";
+import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
 // pdf-parse (via pdfjs-dist) needs browser APIs (DOMMatrix) that don't
 // exist in Node's serverless runtime. Importing it at the top level was
 // crashing the ENTIRE server on every single request — including ones with
@@ -1349,6 +1350,96 @@ app.get("/api/documents/:userId", (req, res) => {
   res.json({ documents: getDocuments(req.params.userId) });
 });
 
+// ---------------------------------------------------------------------------
+// LARGE FILE UPLOADS (real fix for the 4MB/4.5MB wall above): the browser
+// uploads the file bytes DIRECTLY to Vercel Blob storage, never through this
+// serverless function — so Vercel's 4.5MB request-body cap never applies.
+// This function's only job is (1) hand out a short-lived upload token, and
+// (2) after the browser finishes, fetch the (now-hosted) file itself to run
+// text extraction and save the DB row. Both of those requests are tiny.
+//
+// REQUIRES: a Blob store connected to this Vercel project (Vercel dashboard
+// → Storage → create/connect a Blob store), which sets BLOB_READ_WRITE_TOKEN
+// automatically. Without that env var, uploads will fail with a clear error
+// telling you so, rather than the previous silent "Failed to upload file."
+// ---------------------------------------------------------------------------
+const ALLOWED_UPLOAD_MIME_TYPES = [
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json"
+];
+const MAX_BLOB_UPLOAD_BYTES = 50 * 1024 * 1024; // 50MB — matches what the UI has always claimed.
+
+app.post("/api/documents/blob-upload", async (req, res) => {
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    return res.status(503).json({ error: "File storage isn't configured on the server yet. In the Vercel dashboard, go to Storage → create/connect a Blob store to this project, then redeploy." });
+  }
+  const body = req.body as HandleUploadBody;
+  try {
+    const jsonResponse = await handleUpload({
+      body,
+      request: req as any,
+      onBeforeGenerateToken: async () => ({
+        allowedContentTypes: ALLOWED_UPLOAD_MIME_TYPES,
+        maximumSizeInBytes: MAX_BLOB_UPLOAD_BYTES,
+        addRandomSuffix: true
+      }),
+      onUploadCompleted: async ({ blob }) => {
+        // Vercel calls this via webhook once the blob is confirmed stored —
+        // only reachable when this deployment has a public URL (not local
+        // dev). The actual DB save doesn't depend on this: the client calls
+        // /api/documents/finalize explicitly right after upload() resolves,
+        // which works in every environment. This is just a log for visibility.
+        console.log("[blob-upload] Confirmed stored:", blob.url);
+      }
+    });
+    res.json(jsonResponse);
+  } catch (err: any) {
+    console.error("Blob upload token generation failed:", err);
+    res.status(400).json({ error: err.message || "Failed to authorize upload." });
+  }
+});
+
+app.post("/api/documents/finalize", async (req, res) => {
+  try {
+    const { userId, category, blobUrl, filename, size, mimeType } = req.body;
+    if (!userId || !blobUrl || !filename) {
+      return res.status(400).json({ error: "Missing required fields userId, blobUrl, or filename" });
+    }
+    // Fetch the file back from Blob storage server-side (a tiny/no-op
+    // request from this function's perspective, unlike the original upload)
+    // so we can extract its text for Q&A, same as the small-file path does.
+    let text = "";
+    try {
+      const blobRes = await fetch(blobUrl);
+      const arrayBuffer = await blobRes.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      text = await extractTextFromFile({ buffer, originalname: filename, mimetype: mimeType, size: buffer.length } as any);
+    } catch (extractErr) {
+      console.warn("Text extraction failed for large upload (file is still saved, just not searchable via Q&A):", extractErr);
+    }
+    const id = "doc_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6);
+    db.prepare(
+      "INSERT INTO document_knowledge (id, user_id, filename, category, size_bytes, mime_type, extracted_text, blob_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, userId, filename, category || "Other", size || 0, mimeType || "application/octet-stream", text, blobUrl, Date.now());
+    res.json({
+      success: true,
+      document: { id, filename, category: category || "Other", size_bytes: size || 0, mime_type: mimeType, created_at: Date.now() },
+      textExtracted: text.length > 0,
+      documents: getDocuments(userId)
+    });
+  } catch (err: any) {
+    console.error("Finalize large upload failed:", err);
+    res.status(500).json({ error: err.message || "Failed to save uploaded file." });
+  }
+});
+
 app.post("/api/documents/upload", (req, res, next) => {
   upload.single("file")(req, res, (err: any) => {
     if (err) {
@@ -1405,9 +1496,12 @@ app.delete("/api/documents/:userId/:docId", (req, res) => {
 app.get("/api/documents/:userId/:docId/file", (req, res) => {
   const { userId, docId } = req.params;
   const row = db.prepare(
-    "SELECT filename, mime_type, file_data_base64 FROM document_knowledge WHERE id = ? AND user_id = ?"
-  ).get(docId, userId) as { filename: string; mime_type: string | null; file_data_base64: string | null } | undefined;
+    "SELECT filename, mime_type, file_data_base64, blob_url FROM document_knowledge WHERE id = ? AND user_id = ?"
+  ).get(docId, userId) as { filename: string; mime_type: string | null; file_data_base64: string | null; blob_url: string | null } | undefined;
   if (!row) return res.status(404).json({ error: "Document not found" });
+  // Large uploads live in Blob storage — just redirect the browser there
+  // directly, it serves the real file with correct headers on its own.
+  if (row.blob_url) return res.redirect(row.blob_url);
   if (!row.file_data_base64) {
     return res.status(404).json({ error: "Original file bytes weren't stored for this document (uploaded before this feature existed) — only its extracted text is available." });
   }
