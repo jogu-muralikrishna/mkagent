@@ -716,6 +716,22 @@ export async function recordLaptopCommandResult(
   );
 }
 
+// Auto-fail commands that never got a result back (companion offline,
+// crashed, or pointed at the wrong server/user). Without this, a pending
+// command with no responding companion sits as "pending" forever.
+export async function expireStaleLaptopCommands(userId: string, timeoutSeconds = 30): Promise<void> {
+  const pool = await getCorePool();
+  await pool.query(
+    `UPDATE laptop_commands
+     SET status = 'failed',
+         result = 'Timed out — no response from Laptop Companion. Make sure mk_laptop_companion.py is running and pointed at this server.'
+     WHERE user_id = $1
+       AND status = 'pending'
+       AND created_at < now() - ($2::double precision * interval '1 second')`,
+    [userId, timeoutSeconds]
+  );
+}
+
 export async function markLaptopCommandFileReady(
   commandId: string,
   fileName: string,
