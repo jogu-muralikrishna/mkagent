@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { upload as blobUpload } from "@vercel/blob/client";
+import { put as blobPut } from "@vercel/blob/client";
 import {
   RealEmail
 } from "./lib/firebase-types";
@@ -1348,14 +1348,40 @@ export default function App() {
     const f = e.target.files[0];
     setIsUploadingFile(true);
     try {
-      // Uploads straight from the browser to Blob storage — the file bytes
-      // never pass through our serverless function, so Vercel's 4.5MB
-      // request-body cap (the actual cause of "Failed to upload file." on
-      // anything over ~4MB) never applies here.
-      const blob = await blobUpload(f.name, f, {
-        access: "public",
-        handleUploadUrl: "/api/documents/blob-upload"
+      // Manually request the client token instead of using @vercel/blob's
+      // upload() helper: that helper swallows our server's real error
+      // message and always throws the same generic "Failed to retrieve the
+      // client token" on any failure. Doing this step ourselves lets us
+      // show the actual reason (missing env var, wrong content type,
+      // whatever it really is) instead of guessing blind.
+      const callbackUrl = `${window.location.origin}/api/documents/blob-upload`;
+      const tokenRes = await fetch("/api/documents/blob-upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "blob.generate-client-token",
+          payload: {
+            pathname: f.name,
+            callbackUrl,
+            clientPayload: null,
+            multipart: false
+          }
+        })
       });
+      const tokenData = await tokenRes.json().catch(() => ({}));
+      if (!tokenRes.ok || !tokenData.clientToken) {
+        // This is the REAL error from our server, not a generic SDK message.
+        throw new Error(tokenData.error || `Server rejected upload authorization (HTTP ${tokenRes.status}).`);
+      }
+
+      // Now actually upload the bytes straight to Blob storage using that
+      // token — this still never passes through our serverless function,
+      // so the 4.5MB body limit still doesn't apply.
+      const blob = await blobPut(f.name, f, {
+        access: "public",
+        token: tokenData.clientToken
+      });
+
       const res = await fetch("/api/documents/finalize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
