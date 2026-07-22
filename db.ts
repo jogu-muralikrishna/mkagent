@@ -415,9 +415,16 @@ async function getCorePool(): Promise<Pool> {
         );
         ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_bot_token TEXT;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
+        CREATE TABLE IF NOT EXISTS document_upload_chunks (
+          session_id TEXT NOT NULL,
+          chunk_index INTEGER NOT NULL,
+          data_base64 TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (session_id, chunk_index)
+        );
       `)
       .then(() => {
-        console.log("[db] Core Postgres tables ready (tasks/calendar/expenses/automations).");
+        console.log("[db] Core Postgres tables ready (tasks/calendar/expenses/upload chunks).");
       })
       .catch((err) => {
         coreTablesReady = null;
@@ -549,4 +556,36 @@ export async function findUserByTelegramChatId(chatId: string): Promise<UserDoc 
   const pool = await getCorePool();
   const { rows } = await pool.query(`SELECT * FROM users WHERE telegram_chat_id = $1 LIMIT 1`, [chatId]);
   return rows[0] ? rowToUserDoc(rows[0]) : undefined;
+}
+
+// --- Chunked large-file uploads ---
+// Vercel serverless functions hard-cap a single incoming request at 4.5MB,
+// which is a platform limit no amount of app code can raise. Instead of
+// requiring external Blob storage (which needs a manual dashboard
+// connection step), we split big files into small pieces on the client and
+// send each piece as its own well-under-4.5MB request, storing them
+// temporarily in Postgres (already required for users/Telegram) keyed by an
+// upload session id, then reassemble and delete them once all pieces
+// arrive. Real, needs no new external service or dashboard step.
+export async function saveUploadChunk(sessionId: string, chunkIndex: number, dataBase64: string): Promise<void> {
+  const pool = await getCorePool();
+  await pool.query(
+    `INSERT INTO document_upload_chunks (session_id, chunk_index, data_base64) VALUES ($1, $2, $3)
+     ON CONFLICT (session_id, chunk_index) DO UPDATE SET data_base64 = EXCLUDED.data_base64`,
+    [sessionId, chunkIndex, dataBase64]
+  );
+}
+
+export async function getUploadChunksOrdered(sessionId: string): Promise<string[]> {
+  const pool = await getCorePool();
+  const { rows } = await pool.query(
+    `SELECT data_base64 FROM document_upload_chunks WHERE session_id = $1 ORDER BY chunk_index ASC`,
+    [sessionId]
+  );
+  return rows.map((r) => r.data_base64);
+}
+
+export async function deleteUploadChunks(sessionId: string): Promise<void> {
+  const pool = await getCorePool();
+  await pool.query(`DELETE FROM document_upload_chunks WHERE session_id = $1`, [sessionId]);
 }
