@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS document_knowledge (
   size_bytes INTEGER NOT NULL,
   mime_type TEXT,
   extracted_text TEXT,
+  file_data_base64 TEXT,
   created_at INTEGER NOT NULL
 );
 
@@ -411,22 +412,6 @@ async function getCorePool(): Promise<Pool> {
           category TEXT NOT NULL DEFAULT 'General',
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
-        CREATE TABLE IF NOT EXISTS automations (
-          id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          name TEXT NOT NULL,
-          trigger_time TEXT,
-          interval_hours INTEGER,
-          action_type TEXT NOT NULL DEFAULT 'telegram',
-          payload TEXT NOT NULL,
-          active BOOLEAN NOT NULL DEFAULT TRUE,
-          last_run_date TEXT,
-          last_run_at TIMESTAMPTZ,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        ALTER TABLE automations ALTER COLUMN trigger_time DROP NOT NULL;
-        ALTER TABLE automations ADD COLUMN IF NOT EXISTS interval_hours INTEGER;
-        ALTER TABLE automations ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_bot_token TEXT;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
       `)
@@ -563,80 +548,4 @@ export async function findUserByTelegramChatId(chatId: string): Promise<UserDoc 
   const pool = await getCorePool();
   const { rows } = await pool.query(`SELECT * FROM users WHERE telegram_chat_id = $1 LIMIT 1`, [chatId]);
   return rows[0] ? rowToUserDoc(rows[0]) : undefined;
-}
-
-// --- Automations (real, time-of-day OR interval triggered — see
-// /api/cron/run in app.ts). Two mutually exclusive trigger modes:
-//   - triggerTime: fires once/day at that HH:MM (existing behavior)
-//   - intervalHours: fires every N hours regardless of clock time, tracked
-//     via lastRunAt (a precise timestamp, not just a date)
-export interface AutomationDoc {
-  id: string; userId: string; name: string;
-  triggerTime: string | null; intervalHours: number | null;
-  actionType: string; payload: string; active: boolean;
-  lastRunDate: string | null; lastRunAt: string | null;
-}
-
-export async function getAutomations(userId: string): Promise<AutomationDoc[]> {
-  const pool = await getCorePool();
-  const { rows } = await pool.query(
-    `SELECT id, user_id, name, trigger_time, interval_hours, action_type, payload, active, last_run_date, last_run_at
-     FROM automations WHERE user_id=$1 ORDER BY created_at DESC`,
-    [userId]
-  );
-  return rows.map(rowToAutomation);
-}
-
-export async function getAllActiveAutomations(): Promise<AutomationDoc[]> {
-  const pool = await getCorePool();
-  const { rows } = await pool.query(
-    `SELECT id, user_id, name, trigger_time, interval_hours, action_type, payload, active, last_run_date, last_run_at
-     FROM automations WHERE active = TRUE`
-  );
-  return rows.map(rowToAutomation);
-}
-
-function rowToAutomation(r: any): AutomationDoc {
-  return {
-    id: r.id, userId: r.user_id, name: r.name,
-    triggerTime: r.trigger_time, intervalHours: r.interval_hours,
-    actionType: r.action_type, payload: r.payload, active: !!r.active,
-    lastRunDate: r.last_run_date,
-    lastRunAt: r.last_run_at instanceof Date ? r.last_run_at.toISOString() : r.last_run_at
-  };
-}
-
-// Pass EITHER triggerTime ("HH:MM", fires once/day) OR intervalHours
-// (fires every N hours from creation) — not both. Whichever is null tells
-// /api/cron/run which mode to check.
-export async function createAutomation(
-  userId: string, name: string, triggerTime: string | null, intervalHours: number | null,
-  actionType: string, payload: string
-): Promise<AutomationDoc> {
-  const pool = await getCorePool();
-  const id = newRandomId("auto");
-  await pool.query(
-    `INSERT INTO automations (id, user_id, name, trigger_time, interval_hours, action_type, payload, active)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE)`,
-    [id, userId, name, triggerTime, intervalHours, actionType || "telegram", payload]
-  );
-  return {
-    id, userId, name, triggerTime, intervalHours,
-    actionType: actionType || "telegram", payload, active: true, lastRunDate: null, lastRunAt: null
-  };
-}
-
-export async function setAutomationActive(userId: string, id: string, active: boolean): Promise<void> {
-  const pool = await getCorePool();
-  await pool.query(`UPDATE automations SET active=$1 WHERE id=$2 AND user_id=$3`, [active, id, userId]);
-}
-
-export async function deleteAutomation(userId: string, id: string): Promise<void> {
-  const pool = await getCorePool();
-  await pool.query(`DELETE FROM automations WHERE id=$1 AND user_id=$2`, [id, userId]);
-}
-
-export async function markAutomationRun(id: string, dateStr: string): Promise<void> {
-  const pool = await getCorePool();
-  await pool.query(`UPDATE automations SET last_run_date=$1, last_run_at=now() WHERE id=$2`, [dateStr, id]);
-}
+}s
