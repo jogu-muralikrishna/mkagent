@@ -39,6 +39,7 @@ import {
   pullPendingLaptopCommands,
   getLaptopCommandHistory,
   recordLaptopCommandResult,
+  expireStaleLaptopCommands,
   markLaptopCommandFileReady,
   saveLaptopFile,
   getLaptopFile,
@@ -719,7 +720,7 @@ app.get("/api/gmail/unread", requireAuth, async (req: any, res) => {
     res.json({ success: true, emails: fetchedEmails });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message || "Failed to fetch Gmail messages." });
-  } finally {
+  } font-medium {
     if (connection) connection.end();
   }
 });
@@ -957,6 +958,7 @@ interface LaptopState {
 app.get("/api/laptop/status/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
+    await expireStaleLaptopCommands(userId);
     const stored = await getLaptopStatus(userId);
     const status: LaptopState = stored
       ? { ...(stored.metrics as LaptopState), online: stored.online, lastSync: stored.lastSync }
