@@ -4711,12 +4711,12 @@ CREATE POLICY user_isolation_policy_keys ON api_keys
                         <Download className="w-4 h-4 text-emerald-400" />
                         <h3 className="text-xs font-bold text-white uppercase font-mono">Download Companion Client</h3>
                       </div>
-                     <p className="text-[11px] text-zinc-400 leading-relaxed">
-                      To pair your hardware, download and execute our lightweight Python client on your laptop.
-                    </p>
-          <p className="text-[10px] text-amber-400/80 leading-relaxed">
-  ⚠️ If you already have a copy running and see "Connection error", your app's URL may have changed — re-download this file and restart the script.
-</p>
+                      <p className="text-[11px] text-zinc-400 leading-relaxed">
+                        To pair your hardware, download and execute our lightweight Python client on your laptop.
+                      </p>
+                      <p className="text-[10px] text-amber-400/80 leading-relaxed">
+                        ⚠️ If you already have a copy running and see "Connection error", your app's URL may have changed — re-download this file and restart the script.
+                      </p>
 
                       <div className="space-y-3">
                         <button
@@ -4838,9 +4838,34 @@ CREATE POLICY user_isolation_policy_keys ON api_keys
                                   {hist.result}
                                 </pre>
                               )}
-                              {hist.fileReady && (
+                              {hist.fileReady && activeUser?.id && (
                                 <a
                                   href={`/api/laptop/file/${activeUser.id}/${hist.id}`}
+                                  onClick={async (e) => {
+                                    e.preventDefault();
+                                    try {
+                                      const url = `/api/laptop/file/${activeUser.id}/${hist.id}`;
+                                      const res = await fetch(url);
+                                      if (!res.ok) {
+                                        showNotification(
+                                          "File no longer available on the server (it's held in memory and gets cleared on redeploys/cold starts). Fetch it again.",
+                                          "error"
+                                        );
+                                        return;
+                                      }
+                                      const blob = await res.blob();
+                                      const objUrl = URL.createObjectURL(blob);
+                                      const a = document.createElement("a");
+                                      a.href = objUrl;
+                                      a.download = hist.fileName || "download";
+                                      document.body.appendChild(a);
+                                      a.click();
+                                      a.remove();
+                                      URL.revokeObjectURL(objUrl);
+                                    } catch (err) {
+                                      showNotification("Download failed — check your connection and try again.", "error");
+                                    }
+                                  }}
                                   className="inline-flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-[10px] font-bold px-2.5 py-1.5 rounded transition-colors mt-1"
                                   download={hist.fileName}
                                 >
