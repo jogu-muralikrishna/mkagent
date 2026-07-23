@@ -720,7 +720,7 @@ app.get("/api/gmail/unread", requireAuth, async (req: any, res) => {
     res.json({ success: true, emails: fetchedEmails });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message || "Failed to fetch Gmail messages." });
-  } font-medium {
+  } finally {
     if (connection) connection.end();
   }
 });
