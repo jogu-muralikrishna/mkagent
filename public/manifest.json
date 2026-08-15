@@ -1,0 +1,22 @@
+{
+  "name": "MK AI Operating System (AI OS)",
+  "short_name": "MK AI OS",
+  "description": "Personal AI Executive Assistant operating system synchronized across web, mobile, and telegram.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#10b981",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/8649/8649607.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/8649/8649607.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

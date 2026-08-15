@@ -1,0 +1,158 @@
+"""
+Laptop File Search Server
+--------------------------
+Run this on your LAPTOP. It indexes files under ROOT_DIR by name,
+and serves a search API + simple web UI you can open from your
+PHONE's browser (same Wi-Fi network, or via Tailscale/VPN for
+outside-network access).
+
+Usage:
+    pip install flask pandas --break-system-packages   (if not installed)
+    python file_server.py
+
+Then on your phone, open:
+    http://<laptop-ip>:5000
+(find laptop IP with `ipconfig` on Windows or `ifconfig`/`ip a` on Mac/Linux)
+"""
+
+import os
+import json
+import pandas as pd
+from flask import Flask, request, jsonify, send_file, Response
+
+# ---- CONFIG ----
+ROOT_DIR = os.path.expanduser("~")   # folder to search (change if needed)
+INDEX_FILE = "file_index.json"
+HOST = "0.0.0.0"                     # 0.0.0.0 = reachable from other devices
+PORT = 5000
+
+app = Flask(__name__)
+df = pd.DataFrame(columns=["name", "path", "size", "ext"])
+
+
+def build_index():
+    """Walk ROOT_DIR and build a pandas DataFrame index of all files."""
+    global df
+    rows = []
+    for dirpath, _, filenames in os.walk(ROOT_DIR):
+        for name in filenames:
+            full_path = os.path.join(dirpath, name)
+            try:
+                size = os.path.getsize(full_path)
+            except OSError:
+                size = None
+            rows.append({
+                "name": name,
+                "path": full_path,
+                "size": size,
+                "ext": os.path.splitext(name)[1].lower(),
+            })
+    df = pd.DataFrame(rows)
+    df.to_json(INDEX_FILE, orient="records")
+    print(f"Indexed {len(df)} files under {ROOT_DIR}")
+
+
+@app.route("/reindex", methods=["POST"])
+def reindex():
+    build_index()
+    return jsonify({"status": "ok", "count": len(df)})
+
+
+@app.route("/search", methods=["GET"])
+def search():
+    query = request.args.get("q", "").lower()
+    ext = request.args.get("ext", "").lower()
+
+    if df.empty:
+        return jsonify({"results": [], "message": "Index empty, call /reindex first"})
+
+    result = df[df["name"].str.lower().str.contains(query, na=False)]
+    if ext:
+        result = result[result["ext"] == ext]
+
+    result = result.sort_values("name").head(200)
+    return jsonify({"results": result.to_dict(orient="records")})
+
+
+TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".py", ".js", ".ts", ".html",
+             ".css", ".log", ".xml", ".yaml", ".yml"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
+
+
+@app.route("/view")
+def view_file():
+    path = request.args.get("path")
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "File not found"}), 404
+    # Safety check: only allow files inside ROOT_DIR
+    if not os.path.abspath(path).startswith(os.path.abspath(ROOT_DIR)):
+        return jsonify({"error": "Access denied"}), 403
+
+    ext = os.path.splitext(path)[1].lower()
+
+    # Text files: show as plain text in-page
+    if ext in TEXT_EXTS:
+        try:
+            with open(path, "r", errors="replace") as f:
+                content = f.read(200_000)  # cap for very large files
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return Response(content, mimetype="text/plain")
+
+    # Images and PDFs: let browser render natively, inline (not attachment)
+    return send_file(path, as_attachment=False)
+
+
+@app.route("/")
+def home():
+    html = """
+    <html>
+    <head>
+        <title>Laptop File Search</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: sans-serif; margin: 16px; }
+            input, button { font-size: 16px; padding: 8px; }
+            #results { margin-top: 16px; }
+            .item { padding: 8px; border-bottom: 1px solid #ddd; }
+            .item a { text-decoration: none; color: #2563eb; }
+        </style>
+    </head>
+    <body>
+        <h2>Search laptop files</h2>
+        <input id="q" placeholder="File name..." style="width:70%">
+        <button onclick="search()">Search</button>
+        <button onclick="reindex()">Reindex</button>
+        <div id="results"></div>
+        <script>
+            async function search() {
+                const q = document.getElementById('q').value;
+                const res = await fetch('/search?q=' + encodeURIComponent(q));
+                const data = await res.json();
+                const div = document.getElementById('results');
+                div.innerHTML = '';
+                (data.results || []).forEach(f => {
+                    div.innerHTML += `<div class="item">
+                        <a href="/view?path=${encodeURIComponent(f.path)}" target="_blank">${f.name}</a>
+                        <br><small>${f.path}</small></div>`;
+                });
+            }
+            async function reindex() {
+                document.getElementById('results').innerHTML = 'Indexing...';
+                await fetch('/reindex', { method: 'POST' });
+                search();
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return Response(html, mimetype="text/html")
+
+
+if __name__ == "__main__":
+    if os.path.exists(INDEX_FILE):
+        df = pd.read_json(INDEX_FILE)
+        print(f"Loaded existing index: {len(df)} files")
+    else:
+        build_index()
+    app.run(host=HOST, port=PORT, debug=False)

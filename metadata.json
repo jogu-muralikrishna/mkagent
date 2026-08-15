@@ -1,0 +1,8 @@
+{
+  "name": "Remix: MK Personal AI Assistant Dashboard",
+  "description": "Configure, simulate, and download \u0027MK\u0027 – your custom Python Telegram bot with Gmail summaries, News Intelligence, and LangChain-based AI reasoning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
